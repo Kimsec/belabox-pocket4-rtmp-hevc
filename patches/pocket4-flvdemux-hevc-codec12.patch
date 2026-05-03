@@ -1,0 +1,270 @@
+Pocket 4 BELABOX RTMP HEVC patch notes:
+
+- Maps legacy/unofficial FLV video codec ID 12 to H.265.
+- Adds H.265 caps to flvdemux for hvc1 and byte-stream output.
+- Uses AVC-style FLV packet offsets for codec ID 12:
+  packet type at data + 8, composition time at data + 9, payload after 5 bytes.
+- Stores HEVCDecoderConfigurationRecord data from packet type 0 when present.
+- Supports late-subscriber fallback when nginx-rtmp does not replay codec data.
+- Converts 4-byte length-prefixed HEVC NAL units to Annex B byte-stream in fallback.
+- Logs the missing-codec-data fallback warning only once per stream/pipeline start.
+- Leaves H.264 codec ID 7 behavior unchanged.
+
+--- a/gst/flv/gstflvdemux.c
++++ b/gst/flv/gstflvdemux.c
+@@ -86,7 +86,9 @@
+     GST_STATIC_CAPS ("video/x-flash-video, flvversion=(int) 1; "
+         "video/x-flash-screen; "
+         "video/x-vp6-flash; " "video/x-vp6-alpha; "
+-        "video/x-h264, stream-format=avc;")
++        "video/x-h264, stream-format=avc; "
++        "video/x-h265, stream-format=hvc1, alignment=au; "
++        "video/x-h265, stream-format=byte-stream, alignment=au;")
+     );
+ 
+ #define gst_flv_demux_parent_class parent_class
+@@ -1432,6 +1434,23 @@
+           gst_caps_new_simple ("video/x-h264", "stream-format", G_TYPE_STRING,
+           "avc", NULL);
+       break;
++    case 12:
++      if (demux->video_h265_byte_stream_fallback) {
++        caps =
++            gst_caps_new_simple ("video/x-h265", "stream-format",
++            G_TYPE_STRING, "byte-stream", "alignment", G_TYPE_STRING, "au",
++            NULL);
++        break;
++      }
++      if (!demux->video_codec_data) {
++        GST_DEBUG_OBJECT (demux, "don't have h265 codec data yet");
++        ret = TRUE;
++        goto done;
++      }
++      caps =
++          gst_caps_new_simple ("video/x-h265", "stream-format", G_TYPE_STRING,
++          "hvc1", "alignment", G_TYPE_STRING, "au", NULL);
++      break;
+       /* The following two are non-standard but apparently used, see in ffmpeg
+        * https://git.videolan.org/?p=ffmpeg.git;a=blob;f=libavformat/flvdec.c;h=2bf1e059e1cbeeb79e4af9542da23f4560e1cf59;hb=b18d6c58000beed872d6bb1fe7d0fbe75ae26aef#l254
+        * https://git.videolan.org/?p=ffmpeg.git;a=blob;f=libavformat/flvdec.c;h=2bf1e059e1cbeeb79e4af9542da23f4560e1cf59;hb=b18d6c58000beed872d6bb1fe7d0fbe75ae26aef#l282
+@@ -1477,7 +1496,8 @@
+     gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, num, den, NULL);
+   }
+ 
+-  if (demux->video_codec_data) {
++  if (demux->video_codec_data && !(codec_tag == 12 &&
++          demux->video_h265_byte_stream_fallback)) {
+     gst_caps_set_simple (caps, "codec_data", GST_TYPE_BUFFER,
+         demux->video_codec_data, NULL);
+   }
+@@ -1530,6 +1550,87 @@
+   return ret;
+ }
+ 
++static GstBuffer *
++gst_flv_demux_hevc_nalu_to_byte_stream (GstFlvDemux * demux,
++    GstBuffer * buffer, guint offset, guint size)
++{
++  GstBuffer *outbuf;
++  GstMapInfo in_map, out_map;
++  guint in_pos = 0, out_pos = 0;
++  const guint8 *in_data;
++  guint8 *out_data;
++
++  if (G_UNLIKELY (size < 4))
++    return NULL;
++
++  if (!gst_buffer_map (buffer, &in_map, GST_MAP_READ))
++    return NULL;
++
++  in_data = in_map.data + offset;
++
++  if ((size >= 4 && in_data[0] == 0x00 && in_data[1] == 0x00 &&
++          in_data[2] == 0x00 && in_data[3] == 0x01) ||
++      (size >= 3 && in_data[0] == 0x00 && in_data[1] == 0x00 &&
++          in_data[2] == 0x01)) {
++    gst_buffer_unmap (buffer, &in_map);
++    GST_DEBUG_OBJECT (demux, "H.265 fallback payload is already byte-stream");
++    return gst_buffer_copy_region (buffer, GST_BUFFER_COPY_MEMORY, offset,
++        size);
++  }
++
++  outbuf = gst_buffer_new_allocate (NULL, size, NULL);
++  if (G_UNLIKELY (!outbuf)) {
++    gst_buffer_unmap (buffer, &in_map);
++    return NULL;
++  }
++
++  if (!gst_buffer_map (outbuf, &out_map, GST_MAP_WRITE)) {
++    gst_buffer_unref (outbuf);
++    gst_buffer_unmap (buffer, &in_map);
++    return NULL;
++  }
++
++  out_data = out_map.data;
++
++  while (in_pos < size) {
++    guint32 nal_size;
++
++    if (G_UNLIKELY (size - in_pos < 4))
++      goto invalid_length_prefixed_data;
++
++    nal_size = GST_READ_UINT32_BE (in_data + in_pos);
++    in_pos += 4;
++
++    if (G_UNLIKELY (nal_size == 0 || nal_size > size - in_pos))
++      goto invalid_length_prefixed_data;
++
++    out_data[out_pos++] = 0x00;
++    out_data[out_pos++] = 0x00;
++    out_data[out_pos++] = 0x00;
++    out_data[out_pos++] = 0x01;
++    memcpy (out_data + out_pos, in_data + in_pos, nal_size);
++    in_pos += nal_size;
++    out_pos += nal_size;
++  }
++
++  gst_buffer_unmap (outbuf, &out_map);
++  gst_buffer_unmap (buffer, &in_map);
++
++  if (out_pos != size)
++    gst_buffer_resize (outbuf, 0, out_pos);
++
++  return outbuf;
++
++invalid_length_prefixed_data:
++  GST_WARNING_OBJECT (demux,
++      "invalid H.265 length-prefixed fallback payload at offset %u of %u",
++      in_pos, size);
++  gst_buffer_unmap (outbuf, &out_map);
++  gst_buffer_unref (outbuf);
++  gst_buffer_unmap (buffer, &in_map);
++  return NULL;
++}
++
+ static GstFlowReturn
+ gst_flv_demux_parse_tag_video (GstFlvDemux * demux, GstBuffer * buffer)
+ {
+@@ -1589,7 +1690,7 @@
+   codec_tag = flags & 0x0F;
+   if (codec_tag == 4 || codec_tag == 5) {
+     codec_data = 2;
+-  } else if (codec_tag == 7) {
++  } else if (codec_tag == 7 || codec_tag == 12) {
+     codec_data = 5;
+ 
+     cts = GST_READ_UINT24_BE (data + 9);
+@@ -1646,6 +1747,75 @@
+     }
+   }
+ 
++  if (codec_tag == 12) {
++    guint8 hevc_packet_type = GST_READ_UINT8 (data + 8);
++    guint payload_offset = 7 + codec_data;
++    guint payload_size = 0;
++    gchar payload_prefix[16 * 3 + 1] = { 0, };
++
++    if (demux->tag_data_size > codec_data) {
++      guint i, prefix_size;
++
++      payload_size = demux->tag_data_size - codec_data;
++      prefix_size = MIN (payload_size, 16);
++      for (i = 0; i < prefix_size; i++)
++        g_snprintf (payload_prefix + (i * 3), 4, "%02x ",
++            data[payload_offset + i]);
++      if (prefix_size > 0)
++        payload_prefix[prefix_size * 3 - 1] = '\0';
++    }
++
++    GST_DEBUG_OBJECT (demux,
++        "H.265 FLV packet type %u, tag data size %" G_GUINT64_FORMAT
++        ", payload size %u, first bytes %s", hevc_packet_type,
++        demux->tag_data_size, payload_size, payload_prefix);
++
++    switch (hevc_packet_type) {
++      case 0:
++      {
++        if (demux->tag_data_size < codec_data) {
++          GST_ERROR_OBJECT (demux, "Got invalid H.265 codec, ignoring.");
++          break;
++        }
++
++        /* HEVCDecoderConfigurationRecord data */
++        GST_LOG_OBJECT (demux, "got an H.265 codec data packet");
++        if (demux->video_codec_data) {
++          gst_buffer_unref (demux->video_codec_data);
++        }
++        demux->video_codec_data = gst_buffer_copy_region (buffer,
++            GST_BUFFER_COPY_MEMORY, 7 + codec_data,
++            demux->tag_data_size - codec_data);
++        /* Use that buffer data in the caps */
++        if (demux->video_pad)
++          gst_flv_demux_video_negotiate (demux, codec_tag);
++        goto beach;
++      }
++      case 1:
++        /* H.265 NALU packet */
++        if (!demux->video_codec_data) {
++          if (!demux->video_h265_byte_stream_fallback) {
++            GST_WARNING_OBJECT (demux,
++                "H.265 codec data missing before NALU, enabling byte-stream fallback");
++            demux->video_h265_byte_stream_fallback = TRUE;
++          }
++        } else if (demux->video_h265_byte_stream_fallback) {
++          GST_DEBUG_OBJECT (demux,
++              "got a H.265 NALU packet while byte-stream fallback is active");
++        } else {
++          GST_LOG_OBJECT (demux, "got a H.265 NALU video packet");
++        }
++        break;
++      case 2:
++        GST_LOG_OBJECT (demux, "got an H.265 end-of-sequence packet");
++        goto beach;
++      default:
++        GST_WARNING_OBJECT (demux, "invalid video packet type %u",
++            hevc_packet_type);
++        goto beach;
++    }
++  }
++
+   /* If we don't have our video pad created, then create it. */
+   if (G_UNLIKELY (!demux->video_pad)) {
+     demux->video_pad =
+@@ -1730,8 +1900,17 @@
+   }
+ 
+   /* Create buffer from pad */
+-  outbuf = gst_buffer_copy_region (buffer, GST_BUFFER_COPY_MEMORY,
+-      7 + codec_data, demux->tag_data_size - codec_data);
++  if (codec_tag == 12 && demux->video_h265_byte_stream_fallback) {
++    outbuf = gst_flv_demux_hevc_nalu_to_byte_stream (demux, buffer,
++        7 + codec_data, demux->tag_data_size - codec_data);
++    if (G_UNLIKELY (!outbuf)) {
++      ret = GST_FLOW_ERROR;
++      goto beach;
++    }
++  } else {
++    outbuf = gst_buffer_copy_region (buffer, GST_BUFFER_COPY_MEMORY,
++        7 + codec_data, demux->tag_data_size - codec_data);
++  }
+ 
+   /* detect (and deem to be resyncs)  large dts gaps */
+   if (gst_flv_demux_update_resync (demux, dts, demux->video_need_discont,
+@@ -2063,6 +2242,7 @@
+   demux->has_audio = FALSE;
+   demux->has_video = FALSE;
+   demux->got_par = FALSE;
++  demux->video_h265_byte_stream_fallback = FALSE;
+ 
+   demux->indexed = FALSE;
+   demux->upstream_seekable = FALSE;
+--- a/gst/flv/gstflvdemux.h
++++ b/gst/flv/gstflvdemux.h
+@@ -118,6 +118,7 @@
+   gboolean video_need_segment;
+   gboolean got_par;
+   GstBuffer * video_codec_data;
++  gboolean video_h265_byte_stream_fallback;
+   GstClockTime video_start;
+   guint32 last_video_dts;
+   GstClockTime video_time_offset;
