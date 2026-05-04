@@ -18,8 +18,6 @@ REGISTRY_FILE="/tmp/gst-registry-pocket4-belaui.bin"
 rm -f "$DROPIN_FILE"
 rm -f "$PIPELINE_DIR"/h265_pocket4_rtmp_localhost_publish_live_25fps
 rm -f "$PIPELINE_DIR"/h265_pocket4_rtmp_localhost_publish_live_30fps
-rm -f "$PIPELINE_DIR"/h265_pocket4_rtmp_localhost_publish_live_50fps
-rm -f "$PIPELINE_DIR"/h265_pocket4_rtmp_localhost_publish_live_60fps
 rm -f "$REGISTRY_FILE"
 
 systemctl daemon-reload
